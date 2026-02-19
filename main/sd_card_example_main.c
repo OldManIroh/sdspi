@@ -12,28 +12,31 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_netif_sntp.h"
-#include "lwip/apps/sntp.h"
+// #include "lwip/apps/sntp.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "esp_sntp.h"          // Для esp_sntp_servermode_dhcp()
 
 /* ==================== Конфигурация Wi‑Fi ==================== */
-#define WIFI_SSID           "majorpack"          // Замените на свой SSID
-#define WIFI_PASS           "majorpack2023!"      // Замените на свой пароль
-#define WIFI_MAX_RETRY      5
+#define WIFI_SSID "TP-Link_BDF2"          // Имя вашей Wi‑Fi сети
+#define WIFI_PASS "12182541"              // Пароль от Wi‑Fi сети
+#define WIFI_MAX_RETRY 5                   // Максимальное количество попыток подключения
 
 static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT  BIT0
-#define WIFI_FAIL_BIT       BIT1
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
 
 static const char *TAG = "time_logger";
 static int s_retry_num = 0;
 
 /* Обработчик событий Wi‑Fi (стандартный) */
 static void event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data) {
+                          int32_t event_id, void *event_data)
+{
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_retry_num < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
@@ -42,7 +45,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
         ESP_LOGI(TAG, "connect to the AP fail");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
@@ -51,7 +55,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 }
 
 /* Инициализация Wi‑Fi в режиме станции */
-static void wifi_init_sta(void) {
+static void wifi_init_sta(void)
+{
     s_wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -96,22 +101,55 @@ static void wifi_init_sta(void) {
         ESP_LOGI(TAG, "connected to ap SSID: %s", WIFI_SSID);
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID: %s", WIFI_SSID);
-        /* В реальном проекте можно добавить перезагрузку или повторную попытку */
+        /* Здесь можно добавить перезагрузку или повторную попытку */
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
 }
 
-/* ==================== Получение времени по NTP (однократно) ==================== */
-static void obtain_time(void) {
-    ESP_LOGI(TAG, "Initializing SNTP with server: ntp.msk-ix.ru");
+/* ==================== Получение времени по NTP (с поддержкой DHCP) ==================== */
 
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.msk-ix.ru");
-    config.sync_cb = NULL;
+/**
+ * @brief Колбэк, вызываемый при успешной синхронизации времени.
+ */
+void time_sync_notification_cb(struct timeval *tv) {
+    ESP_LOGI(TAG, "=== NTP СИНХРОНИЗАЦИЯ УСПЕШНА! ===");
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    char strftime_buf[64];
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI(TAG, "Текущее время: %s", strftime_buf);
+}
+
+/**
+ * @brief Инициализация SNTP и ожидание синхронизации.
+ *        Сначала включается запрос NTP-сервера через DHCP,
+ *        затем SNTP конфигурируется с резервными серверами.
+ */
+static void obtain_time(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP with DHCP option and fallback servers");
+
+    // 1. Включаем запрос NTP-сервера через DHCP (опция 42)
+    //    Эта функция должна вызываться до инициализации SNTP.
+    esp_sntp_servermode_dhcp(true);
+
+    // 2. Базовая конфигурация SNTP (с резервными серверами)
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG();
+    config.num_of_servers = 4;                      // Количество резервных серверов
+    config.servers[0] = "ntp.msk-ix.ru";           // Основной (если DHCP не дал свой)
+    config.servers[1] = "ru.pool.ntp.org";
+    config.servers[2] = "pool.ntp.org";
+    config.servers[3] = "time.google.com";
+    config.sync_cb = time_sync_notification_cb;     // Колбэк при успехе
+
     esp_netif_sntp_init(&config);
 
+    // 3. Ждём синхронизации с увеличенным таймаутом (30 попыток * 2 сек = 60 сек)
     int retry = 0;
-    const int retry_count = 15;
+    const int retry_count = 30;
     while (esp_netif_sntp_sync_wait(2000 / portTICK_PERIOD_MS) == ESP_ERR_TIMEOUT && ++retry < retry_count) {
         ESP_LOGI(TAG, "Waiting for NTP time sync... (%d/%d)", retry, retry_count);
     }
@@ -119,29 +157,33 @@ static void obtain_time(void) {
     if (retry < retry_count) {
         ESP_LOGI(TAG, "Time synchronized successfully");
     } else {
-        ESP_LOGE(TAG, "Failed to synchronize time");
+        ESP_LOGE(TAG, "Failed to synchronize time - check network or NTP servers");
     }
 
-    esp_netif_sntp_deinit();
+    // Не вызываем esp_netif_sntp_deinit() – оставляем SNTP работать в фоне,
+    // чтобы он мог периодически обновлять время (хотя нам нужна только однократная синхронизация,
+    // деинициализация может помешать колбэку и дальнейшей работе SNTP).
+    // Если вы всё же хотите остановить SNTP, закомментируйте эту строку.
+    // esp_netif_sntp_deinit();
 }
 
 /* ==================== Работа с SD‑картой ==================== */
-// Пины SPI – можно задать через menuconfig или прямо здесь
-#define PIN_NUM_MISO   20   
-#define PIN_NUM_MOSI   19  
-#define PIN_NUM_CLK    18   
-#define PIN_NUM_CS     15     
+#define PIN_NUM_MISO 20
+#define PIN_NUM_MOSI 19
+#define PIN_NUM_CLK  18
+#define PIN_NUM_CS   15
 
-#define MOUNT_POINT     "/sdcard"
-#define MIN_FREE_BYTES  (1024 * 1024)             // Минимум 1 МБ свободно
+#define MOUNT_POINT "/sdcard"
+#define MIN_FREE_BYTES (1024 * 1024) // Минимум 1 МБ свободно
 
 static sdmmc_card_t *s_card = NULL;
 static bool s_sd_mounted = false;
 
 /* Монтирование SD‑карты. Возвращает ESP_OK при успехе. */
-static esp_err_t mount_sd_card(void) {
+static esp_err_t mount_sd_card(void)
+{
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,   // Не форматировать автоматически
+        .format_if_mount_failed = false,
         .max_files = 5,
         .allocation_unit_size = 16 * 1024
     };
@@ -183,8 +225,9 @@ static esp_err_t mount_sd_card(void) {
 }
 
 /* Проверка свободного места на SD‑карте */
-static bool check_free_space(void) {
-    uint64_t total_bytes, free_bytes;   // используем uint64_t
+static bool check_free_space(void)
+{
+    uint64_t total_bytes, free_bytes;
     esp_err_t ret = esp_vfs_fat_info(MOUNT_POINT, &total_bytes, &free_bytes);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_vfs_fat_info failed: %s", esp_err_to_name(ret));
@@ -198,78 +241,69 @@ static bool check_free_space(void) {
 }
 
 /* ==================== Задача записи меток времени ==================== */
-// Интервал записи 0.2 с = 200 мс
-#define WRITE_INTERVAL_MS    200
-// Интервал смены файла 10 минут = 600 секунд
-#define FILE_ROTATION_SEC    600
+#define WRITE_INTERVAL_MS  200
+#define FILE_ROTATION_SEC  600
 
-// Массив сокращений дней недели (на английском)
 static const char *day_names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
-/* Формирование имени файла на основе текущего времени */
-static void make_filename(char *buf, size_t len, const struct tm *tm_info) {
-    int wday = tm_info->tm_wday;  // 0 = воскресенье
+static void make_filename(char *buf, size_t len, const struct tm *tm_info)
+{
+    int wday = tm_info->tm_wday;
     if (wday < 0 || wday > 6) wday = 0;
     snprintf(buf, len, MOUNT_POINT "/%s_%02d%02d.txt",
              day_names[wday], tm_info->tm_hour, tm_info->tm_min);
 }
 
-/* Задача: бесконечный цикл записи */
-static void write_task(void *pvParameters) {
+static void write_task(void *pvParameters)
+{
     FILE *f = NULL;
-    time_t last_open_time = 0;          // время открытия текущего файла (сек)
+    time_t last_open_time = 0;
     char filename[64];
 
     while (1) {
-        // Получаем текущее время с микросекундами
         struct timeval tv;
         gettimeofday(&tv, NULL);
         time_t now = tv.tv_sec;
         struct tm tm_info;
         localtime_r(&now, &tm_info);
 
-        // Проверка, что время установлено (год не 1970)
+        // Проверка, что время установлено
         if (tm_info.tm_year < (2024 - 1900)) {
             ESP_LOGW(TAG, "System time not yet valid, waiting...");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
-        // Проверка свободного места на карте
+        // Проверка свободного места
         if (!check_free_space()) {
             ESP_LOGE(TAG, "Insufficient free space. Stopping writes.");
             if (f) {
                 fclose(f);
                 f = NULL;
             }
-            break;  // Выход из задачи
+            break;
         }
 
-        // Проверка, нужно ли сменить файл (каждые FILE_ROTATION_SEC секунд)
+        // Смена файла каждые 10 минут
         if (f == NULL || (now - last_open_time) >= FILE_ROTATION_SEC) {
-            // Закрываем старый файл, если открыт
             if (f) {
                 fclose(f);
                 f = NULL;
             }
-            // Формируем имя нового файла
             make_filename(filename, sizeof(filename), &tm_info);
             ESP_LOGI(TAG, "Opening new file: %s", filename);
-
-            // Открываем файл для записи (перезапись, если уже существует – но такого не должно быть)
             f = fopen(filename, "w");
             if (f == NULL) {
                 ESP_LOGE(TAG, "Failed to open file %s", filename);
-                // Если не удалось открыть, пробуем снова через некоторое время
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
             last_open_time = now;
         }
 
-        // Формируем строку с меткой времени (до миллисекунд)
+        // Формирование строки с миллисекундами
         char time_str[64];
-        int ms = tv.tv_usec / 1000;  // миллисекунды
+        int ms = tv.tv_usec / 1000;
         snprintf(time_str, sizeof(time_str),
                  "%04d-%02d-%02d %02d:%02d:%02d.%03d\n",
                  tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
@@ -281,17 +315,13 @@ static void write_task(void *pvParameters) {
             ESP_LOGE(TAG, "Write error: %s", strerror(errno));
             fclose(f);
             f = NULL;
-            // Можно попытаться переоткрыть файл на следующей итерации
         } else {
-            // Сбрасываем буферы на карту (для надёжности)
             fflush(f);
         }
 
-        // Ждём следующий интервал
         vTaskDelay(pdMS_TO_TICKS(WRITE_INTERVAL_MS));
     }
 
-    // При выходе закрываем файл, если открыт
     if (f) {
         fclose(f);
     }
@@ -300,7 +330,8 @@ static void write_task(void *pvParameters) {
 }
 
 /* ==================== Точка входа ==================== */
-void app_main(void) {
+void app_main(void)
+{
     // Инициализация NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -309,17 +340,34 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Подключаемся к Wi‑Fi (блокируется до подключения или ошибки)
+    // ВАЖНО: Включить запрос NTP-сервера из DHCP ДО инициализации SNTP
+    // и до подключения к Wi-Fi (но после инициализации esp_netif)
+    // Мы вызовем это внутри obtain_time(), но сам obtain_time() вызовем после инициализации
+    // сетевого интерфейса, который создаётся в wifi_init_sta().
+    // Однако esp_sntp_servermode_dhcp() должна быть вызвана до esp_netif_sntp_init().
+    // Поэтому мы не можем вызывать её после wifi_init_sta(), потому что тогда esp_netif уже создан.
+    // Решение: вынести включение режима DHCP до создания netif или использовать флаг.
+    // Но так как esp_netif_sntp_init() создаёт свой собственный netif для SNTP,
+    // можно сначала создать основной netif в wifi_init_sta(), потом вызвать esp_sntp_servermode_dhcp(),
+    // а потом инициализировать SNTP. Это допустимо.
+
+    // Поэтому порядок такой:
+    // 1. Инициализация NVS
+    // 2. Инициализация сети (esp_netif_init, esp_event_loop_create_default) – это делает wifi_init_sta
+    // 3. В wifi_init_sta также создаётся станционный netif.
+    // 4. После wifi_init_sta вызываем esp_sntp_servermode_dhcp(true) и инициализируем SNTP.
+
+    // Подключаемся к Wi-Fi (функция создаёт netif и ожидает подключения)
     wifi_init_sta();
 
-    // Получаем время по NTP (однократно)
+    // Теперь включаем DHCP-запрос NTP и инициализируем SNTP
     obtain_time();
 
-    // Устанавливаем часовой пояс Москвы (UTC+3)
+    // Устанавливаем часовой пояс Москвы
     setenv("TZ", "MSK-3", 1);
     tzset();
 
-    // Проверяем, что время действительно установлено
+    // Проверяем, что время установлено
     time_t now;
     time(&now);
     struct tm tm_info;
@@ -338,6 +386,5 @@ void app_main(void) {
     // Запускаем задачу записи
     xTaskCreate(write_task, "write_task", 4096, NULL, 5, NULL);
 
-    // app_main может завершиться, задача продолжит работу
     ESP_LOGI(TAG, "Main task finished. Write task running.");
 }
